@@ -82,4 +82,4 @@ This project is licensed under the MIT License. Feel free to use and modify it a
 Pull requests are welcome! If you have suggestions or bug reports, please open an issue.
 
 ## 📬 Contact
-For questions or support, reach out via [your contact info].
+For questions or support, reach out via msrishav28@gmail.com
