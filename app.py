@@ -9,16 +9,24 @@ import PyPDF2
 import pickle
 from datetime import datetime
 import logging
+import sys
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("chatbot.log"),  # Save to file
-        logging.StreamHandler()  # Also print to console
-    ]
-)
+# Set up logging with error handling
+try:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler("chatbot.log"),  # Save to file
+            logging.StreamHandler()  # Also print to console
+        ]
+    )
+except PermissionError:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler()]  # Only print to console if file logging fails
+    )
 logger = logging.getLogger(__name__)
 
 # Set page config as the first Streamlit command
@@ -30,25 +38,48 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_ENV = os.getenv("PINECONE_ENV")
 
-# Initialize Groq client
-groq_client = Groq(api_key=GROQ_API_KEY)
+# Validate API keys
+if not GROQ_API_KEY:
+    st.error("GROQ_API_KEY not found in environment variables. Please add it to your .env file.")
+    sys.exit(1)
+if not PINECONE_API_KEY:
+    st.error("PINECONE_API_KEY not found in environment variables. Please add it to your .env file.")
+    sys.exit(1)
+if not PINECONE_ENV:
+    st.error("PINECONE_ENV not found in environment variables. Please add it to your .env file.")
+    sys.exit(1)
 
-# Initialize Pinecone
-pc = Pinecone(api_key=PINECONE_API_KEY)
-index_name = "chatbot-index"
+# Initialize Groq client with error handling
+try:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+except Exception as e:
+    st.error(f"Failed to initialize Groq client: {str(e)}")
+    sys.exit(1)
 
-if index_name not in pc.list_indexes().names():
-    logger.info(f"Creating new Pinecone index: {index_name}")
-    pc.create_index(
-        name=index_name,
-        dimension=384,
-        metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region=PINECONE_ENV)
-    )
-index = pc.Index(index_name)
+# Initialize Pinecone with error handling
+try:
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    index_name = "chatbot-index"
 
-# Initialize embeddings
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    if index_name not in pc.list_indexes().names():
+        logger.info(f"Creating new Pinecone index: {index_name}")
+        pc.create_index(
+            name=index_name,
+            dimension=384,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region=PINECONE_ENV)
+        )
+    index = pc.Index(index_name)
+except Exception as e:
+    st.error(f"Failed to initialize Pinecone: {str(e)}")
+    sys.exit(1)
+
+# Initialize embeddings with error handling
+try:
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+except Exception as e:
+    st.error(f"Failed to initialize embeddings: {str(e)}")
+    sys.exit(1)
 
 # Persistence functions
 def save_chat_sessions(sessions):
@@ -73,23 +104,44 @@ def load_uploaded_files():
     except FileNotFoundError:
         return []
 
-# Process uploaded files
+# Process uploaded files with improved error handling
 def process_file(file):
-    logger.info(f"Processing file: {file.name}")
-    if file.name.endswith(".pdf"):
-        pdf_reader = PyPDF2.PdfReader(file)
-        text = "".join(page.extract_text() for page in pdf_reader.pages)
-    else:
-        text = file.read().decode("utf-8")
-    
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    chunks = text_splitter.split_text(text)
-    
-    for i, chunk in enumerate(chunks):
-        embedding = embeddings.embed_query(chunk)
-        index.upsert([(f"{file.name}_chunk_{i}", embedding, {"text": chunk, "file_name": file.name})])
-    logger.info(f"Upserted {len(chunks)} chunks to Pinecone for {file.name}")
-    return len(chunks)
+    try:
+        logger.info(f"Processing file: {file.name}")
+        if file.name.endswith(".pdf"):
+            try:
+                pdf_reader = PyPDF2.PdfReader(file)
+                text = "".join(page.extract_text() for page in pdf_reader.pages)
+            except Exception as e:
+                logger.error(f"Error reading PDF file: {str(e)}")
+                st.error(f"Error reading PDF file: {str(e)}")
+                return 0
+        else:
+            try:
+                text = file.read().decode("utf-8")
+            except Exception as e:
+                logger.error(f"Error reading text file: {str(e)}")
+                st.error(f"Error reading text file: {str(e)}")
+                return 0
+        
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        chunks = text_splitter.split_text(text)
+        
+        for i, chunk in enumerate(chunks):
+            try:
+                embedding = embeddings.embed_query(chunk)
+                index.upsert([(f"{file.name}_chunk_{i}", embedding, {"text": chunk, "file_name": file.name})])
+            except Exception as e:
+                logger.error(f"Error upserting chunk {i}: {str(e)}")
+                st.error(f"Error processing document chunk {i}: {str(e)}")
+                continue
+                
+        logger.info(f"Upserted {len(chunks)} chunks to Pinecone for {file.name}")
+        return len(chunks)
+    except Exception as e:
+        logger.error(f"Unexpected error processing file: {str(e)}")
+        st.error(f"Unexpected error processing file: {str(e)}")
+        return 0
 
 # Retrieve chunks with metadata
 def retrieve_chunks(query, top_k=3):
@@ -239,8 +291,8 @@ if prompt:
             chunks_with_metadata = retrieve_chunks(prompt)
             context = "\n".join(chunk for chunk, _ in chunks_with_metadata)
             if not context:
-                st.markdown("I don’t have enough context. Please upload a document!")
-                full_response = "I don’t have enough context. Please upload a document!"
+                st.markdown("I don't have enough context. Please upload a document!")
+                full_response = "I don't have enough context. Please upload a document!"
             else:
                 response_stream = generate_response(prompt, context, st.session_state.selected_model)
                 response_placeholder = st.empty()
